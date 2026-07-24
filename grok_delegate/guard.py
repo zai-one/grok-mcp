@@ -2,6 +2,9 @@
 
 Unit-testable. Never emits --always-approve. Fail-closed on reserved lanes
 and over-cap max_turns.
+
+Headless launch uses documented ``-p/--single`` (or ``--prompt-file``) — never a
+bare interactive positional prompt. Permission mode is never bypassPermissions.
 """
 
 from __future__ import annotations
@@ -19,6 +22,28 @@ RESERVED_LANE_NAMES = frozenset({"dev", "master", "main"})
 _LANE_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 ALWAYS_APPROVE_FLAG = "--always-approve"
+BYPASS_PERMISSIONS_MODE = "bypassPermissions"
+
+# Documented headless interfaces from live ``grok --help`` (R1).
+HEADLESS_SINGLE_LONG = "--single"
+HEADLESS_SINGLE_SHORT = "-p"
+HEADLESS_PROMPT_FILE = "--prompt-file"
+HEADLESS_PROMPT_JSON = "--prompt-json"
+HEADLESS_FLAGS = frozenset(
+    {
+        HEADLESS_SINGLE_LONG,
+        HEADLESS_SINGLE_SHORT,
+        HEADLESS_PROMPT_FILE,
+        HEADLESS_PROMPT_JSON,
+    }
+)
+
+# Safe permission modes from live ``grok --help`` (R3). Never bypassPermissions.
+PERMISSION_MODE_EXECUTE = "dontAsk"
+PERMISSION_MODE_PLAN = "plan"
+ALLOWED_PERMISSION_MODES = frozenset(
+    {"default", "acceptEdits", "auto", "dontAsk", "plan"}
+)
 
 # Default binary name; path resolution is runner concern.
 DEFAULT_GROK_BIN = "grok"
@@ -26,9 +51,14 @@ DEFAULT_GROK_BIN = "grok"
 # Deny rules applied to every execute profile (B2).
 _DENY_PUSH = "Bash(git push*)"
 _DENY_MERGE = "Bash(git merge*)"
+# UNC absolute-path patterns (legacy / non-Windows-drive).
 _DENY_CWD_ESCAPE_WRITE = "Write(//**)"
 _DENY_CWD_ESCAPE_EDIT = "Edit(//**)"
 _DENY_CWD_ESCAPE_READ_ABS = "Read(//**)"
+# Windows drive absolute paths (R3) — best-effort globs for the permission engine.
+_DENY_WIN_WRITE = "Write([A-Za-z]:/**)"
+_DENY_WIN_EDIT = "Edit([A-Za-z]:/**)"
+_DENY_WIN_READ = "Read([A-Za-z]:/**)"
 _DENY_HOME_GROK = "Read(~/.grok/**)"
 _DENY_HOME_GROK_WRITE = "Write(~/.grok/**)"
 _DENY_SECRETS = "Read(**/*secret*)"
@@ -46,6 +76,8 @@ _BASE_DENY: tuple[str, ...] = (
     _DENY_FORCE_PUSH,
     _DENY_CWD_ESCAPE_WRITE,
     _DENY_CWD_ESCAPE_EDIT,
+    _DENY_WIN_WRITE,
+    _DENY_WIN_EDIT,
     _DENY_HOME_GROK,
     _DENY_HOME_GROK_WRITE,
     _DENY_SECRETS,
@@ -77,6 +109,8 @@ _PLAN_DISALLOWED = (
     "mcp",
 )
 
+# R2: no interpreter wildcards (python*/pytest*/npm*). Those would nullify
+# every shell deny via arbitrary code execution. Shell allow is git-only.
 _EXECUTE_ALLOW: tuple[str, ...] = (
     "Read(**)",
     "Write(**)",
@@ -86,9 +120,21 @@ _EXECUTE_ALLOW: tuple[str, ...] = (
     "Bash(git log*)",
     "Bash(git add*)",
     "Bash(git commit*)",
-    "Bash(python*)",
-    "Bash(pytest*)",
-    "Bash(npm*)",
+)
+
+# Interpreters that must never appear as execute allow rules (R2).
+_FORBIDDEN_EXECUTE_ALLOW_PREFIXES: tuple[str, ...] = (
+    "Bash(python",
+    "Bash(pytest",
+    "Bash(npm",
+    "Bash(node",
+    "Bash(npx",
+    "Bash(sh",
+    "Bash(bash",
+    "Bash(cmd",
+    "Bash(powershell",
+    "Bash(pwsh",
+    "Bash(*)",
 )
 
 _PLAN_ALLOW: tuple[str, ...] = (
@@ -180,9 +226,15 @@ def enforce_bounds(max_turns: int | None, *, hard_cap: int = HARD_CAP_MAX_TURNS)
 def build_permission_profile(plan_only: bool = False) -> dict[str, list[str]]:
     """Build guarded allow/deny/disallowed_tools profile (B2).
 
-    Execute: read/write/edit inside cwd + safe shell; deny push/merge/cwd-escape
-    absolute paths, live/device/prod/root, secrets, ~/.grok.
+    Execute: read/write/edit inside cwd + git-only shell; deny push/merge,
+    absolute-path write/edit (UNC + Windows drive globs), live/device/prod/root,
+    secrets, ~/.grok. Interpreters are not allowlisted (R2).
+
     Plan-only: read-only (deny all write/edit/shell mutation).
+
+    Note (R3): pattern deny is best-effort for the permission engine. Relative
+    ``../`` traversal and true OS-level cwd confinement are **not** guaranteed
+    by allow/deny strings alone; see EVIDENCE.md.
     """
     if plan_only:
         deny = list(_BASE_DENY) + [_PLAN_DENY_WRITE, _PLAN_DENY_EDIT, _PLAN_DENY_BASH]
@@ -190,13 +242,34 @@ def build_permission_profile(plan_only: bool = False) -> dict[str, list[str]]:
             "allow": list(_PLAN_ALLOW),
             "deny": deny,
             "disallowed_tools": list(_PLAN_DISALLOWED),
+            "permission_mode": PERMISSION_MODE_PLAN,
         }
 
     return {
         "allow": list(_EXECUTE_ALLOW),
-        "deny": list(_BASE_DENY) + [_DENY_CWD_ESCAPE_READ_ABS],
+        "deny": list(_BASE_DENY) + [_DENY_CWD_ESCAPE_READ_ABS, _DENY_WIN_READ],
         "disallowed_tools": list(_BASE_DISALLOWED_TOOLS),
+        "permission_mode": PERMISSION_MODE_EXECUTE,
     }
+
+
+def permission_mode_for_profile(
+    profile: Mapping[str, Sequence[str]] | Mapping[str, Any],
+    *,
+    plan_only: bool = False,
+) -> str:
+    """Resolve permission mode from profile or plan_only flag; never bypass."""
+    raw = profile.get("permission_mode") if isinstance(profile, Mapping) else None
+    if raw is None:
+        mode = PERMISSION_MODE_PLAN if plan_only else PERMISSION_MODE_EXECUTE
+    else:
+        mode = str(raw)
+    if mode == BYPASS_PERMISSIONS_MODE or mode not in ALLOWED_PERMISSION_MODES:
+        raise GuardError(
+            "PERMISSION_MODE_FORBIDDEN",
+            f"permission mode {mode!r} is not allowed",
+        )
+    return mode
 
 
 def build_grok_argv(
@@ -210,11 +283,13 @@ def build_grok_argv(
     grok_bin: str = DEFAULT_GROK_BIN,
     hard_cap: int = HARD_CAP_MAX_TURNS,
 ) -> list[str]:
-    """Assemble argv for local grok headless executor.
+    """Assemble argv for local grok **headless** executor (R1).
 
+    Uses documented ``--single`` (alias ``-p``) so the process is non-TUI.
     Never includes ``--always-approve``. Always pins ``--cwd`` to worktree,
-    uses JSON output, enforces max_turns hard cap, and applies profile
-    --allow/--deny/--disallowed-tools. ``--no-plan`` only when not plan_only.
+    sets ``--permission-mode`` (never bypassPermissions), uses JSON output,
+    enforces max_turns hard cap, and applies profile --allow/--deny/
+    --disallowed-tools. ``--no-plan`` only when not plan_only.
     """
     if not goal or not str(goal).strip():
         raise GuardError("GOAL_EMPTY", "goal is required")
@@ -225,6 +300,9 @@ def build_grok_argv(
     allow = list(profile.get("allow") or ())
     deny = list(profile.get("deny") or ())
     disallowed = list(profile.get("disallowed_tools") or ())
+    mode = permission_mode_for_profile(profile, plan_only=plan_only)
+
+    _assert_execute_allow_safe(allow)
 
     argv: list[str] = [
         grok_bin,
@@ -234,6 +312,8 @@ def build_grok_argv(
         "json",
         "--max-turns",
         str(turns),
+        "--permission-mode",
+        mode,
     ]
 
     if model:
@@ -250,11 +330,24 @@ def build_grok_argv(
     if not plan_only:
         argv.append("--no-plan")
 
-    # Goal prompt last as positional (or after flags). Never smuggle always-approve.
-    argv.append(str(goal).strip())
+    # R1: headless single-prompt interface — not bare interactive positional.
+    argv.extend([HEADLESS_SINGLE_LONG, str(goal).strip()])
 
     _assert_no_always_approve(argv)
+    assert_argv_safe(argv)
     return argv
+
+
+def _assert_execute_allow_safe(allow: Sequence[str]) -> None:
+    """Reject broad interpreter / shell allows that nullify deny rules (R2)."""
+    for rule in allow:
+        s = str(rule)
+        for prefix in _FORBIDDEN_EXECUTE_ALLOW_PREFIXES:
+            if s.startswith(prefix) or s == prefix.rstrip("(") + "(*)":
+                raise GuardError(
+                    "ALLOW_INTERPRETER_FORBIDDEN",
+                    f"execute allow must not include interpreter/shell rule {s!r}",
+                )
 
 
 def _assert_no_always_approve(argv: Sequence[str]) -> None:
@@ -266,29 +359,89 @@ def _assert_no_always_approve(argv: Sequence[str]) -> None:
             )
 
 
+def argv_has_headless_interface(argv: Sequence[str]) -> bool:
+    """True if argv uses a documented non-interactive prompt interface (R1)."""
+    parts = [str(a) for a in argv]
+    for i, part in enumerate(parts):
+        if part in HEADLESS_FLAGS:
+            # Flag must carry a value (next argv token) except we only require presence.
+            if part in {HEADLESS_SINGLE_LONG, HEADLESS_SINGLE_SHORT, HEADLESS_PROMPT_FILE, HEADLESS_PROMPT_JSON}:
+                if i + 1 >= len(parts):
+                    return False
+                # Value must not look like another flag.
+                if parts[i + 1].startswith("-") and parts[i + 1] not in {"-"}:
+                    # allow negative-looking content? treat leading -- as missing value
+                    if parts[i + 1].startswith("--"):
+                        return False
+            return True
+        if part.startswith(f"{HEADLESS_SINGLE_LONG}="):
+            return True
+        if part.startswith(f"{HEADLESS_PROMPT_FILE}="):
+            return True
+        if part.startswith(f"{HEADLESS_PROMPT_JSON}="):
+            return True
+    return False
+
+
 def profile_denies_push(profile: Mapping[str, Sequence[str]]) -> bool:
-    """True if profile deny/disallowed covers git push."""
-    blob = " ".join(profile.get("deny") or ()).lower()
-    tools = " ".join(profile.get("disallowed_tools") or ()).lower()
-    return "push" in blob or "git_push" in tools
+    """True if profile deny/disallowed structurally covers git push (R4)."""
+    deny = [str(d) for d in (profile.get("deny") or ())]
+    tools = [str(t).lower() for t in (profile.get("disallowed_tools") or ())]
+    if "git_push" in tools:
+        return True
+    for rule in deny:
+        # Exact shipped rule or git-push bash deny — not a bare "push" substring hunt.
+        if rule == _DENY_PUSH or rule == _DENY_FORCE_PUSH:
+            return True
+        if rule.startswith("Bash(git push"):
+            return True
+    return False
 
 
 def profile_denies_merge(profile: Mapping[str, Sequence[str]]) -> bool:
-    """True if profile deny/disallowed covers git merge."""
-    blob = " ".join(profile.get("deny") or ()).lower()
-    tools = " ".join(profile.get("disallowed_tools") or ()).lower()
-    return "merge" in blob or "git_merge" in tools
+    """True if profile deny/disallowed structurally covers git merge (R4)."""
+    deny = [str(d) for d in (profile.get("deny") or ())]
+    tools = [str(t).lower() for t in (profile.get("disallowed_tools") or ())]
+    if "git_merge" in tools:
+        return True
+    for rule in deny:
+        if rule == _DENY_MERGE or rule.startswith("Bash(git merge"):
+            return True
+    return False
 
 
 def profile_denies_cwd_escape(profile: Mapping[str, Sequence[str]]) -> bool:
-    """True if profile denies absolute-path / home escape patterns."""
-    deny = list(profile.get("deny") or ())
-    joined = " ".join(deny)
-    return (
-        "//**" in joined
-        or "~/.grok" in joined
-        or any("Write(//" in d or "Edit(//" in d for d in deny)
+    """True if profile includes absolute-path deny rules (UNC and/or Windows).
+
+    This is a structural check on shipped deny rules — not a claim of OS-level
+    confinement. Relative ``../`` escape remains a documented non-guarantee.
+    """
+    deny = [str(d) for d in (profile.get("deny") or ())]
+    has_unc_write = _DENY_CWD_ESCAPE_WRITE in deny or any(
+        d.startswith("Write(//") for d in deny
     )
+    has_unc_edit = _DENY_CWD_ESCAPE_EDIT in deny or any(
+        d.startswith("Edit(//") for d in deny
+    )
+    has_win_write = _DENY_WIN_WRITE in deny or any(
+        "Write([A-Za-z]:" in d for d in deny
+    )
+    has_win_edit = _DENY_WIN_EDIT in deny or any(
+        "Edit([A-Za-z]:" in d for d in deny
+    )
+    has_home = _DENY_HOME_GROK in deny or any("~/.grok" in d for d in deny)
+    # Require Windows drive denies (R3) plus home protect; UNC alone is insufficient on Windows.
+    return (has_win_write and has_win_edit) and has_home and (has_unc_write or has_unc_edit)
+
+
+def profile_allows_interpreters(profile: Mapping[str, Sequence[str]]) -> bool:
+    """True if execute allow list includes interpreter wildcards (R2 fail signal)."""
+    for rule in profile.get("allow") or ():
+        s = str(rule)
+        for prefix in _FORBIDDEN_EXECUTE_ALLOW_PREFIXES:
+            if s.startswith(prefix):
+                return True
+    return False
 
 
 def assert_argv_safe(argv: Sequence[str]) -> None:
@@ -298,6 +451,27 @@ def assert_argv_safe(argv: Sequence[str]) -> None:
         raise GuardError("ARGV_MISSING_CWD", "argv must pin --cwd to worktree")
     if "--output-format" not in argv or "json" not in argv:
         raise GuardError("ARGV_MISSING_JSON", "argv must use --output-format json")
+    if not argv_has_headless_interface(argv):
+        raise GuardError(
+            "ARGV_NOT_HEADLESS",
+            "argv must use -p/--single, --prompt-file, or --prompt-json (not bare interactive prompt)",
+        )
+    # Permission mode required and never bypass.
+    if "--permission-mode" not in argv:
+        raise GuardError(
+            "ARGV_MISSING_PERMISSION_MODE",
+            "argv must set --permission-mode",
+        )
+    try:
+        idx = list(argv).index("--permission-mode")
+        mode = str(argv[idx + 1]) if idx + 1 < len(argv) else ""
+    except (ValueError, IndexError):
+        mode = ""
+    if mode == BYPASS_PERMISSIONS_MODE or mode not in ALLOWED_PERMISSION_MODES:
+        raise GuardError(
+            "PERMISSION_MODE_FORBIDDEN",
+            f"permission mode {mode!r} is not allowed",
+        )
 
 
 def structured_error(code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -309,3 +483,49 @@ def structured_error(code: str, message: str, **extra: Any) -> dict[str, Any]:
     }
     out.update(extra)
     return dict(out)
+
+
+def validate_grok_bin(value: str | None, *, from_client: bool = False) -> str:
+    """Resolve/validate grok binary (R5).
+
+    Client-supplied ``grok_bin`` is always rejected. Env/config values may be
+    the bare name ``grok`` / ``grok.exe`` or an absolute path whose basename is
+    ``grok`` / ``grok.exe`` (no arbitrary interpreters).
+    """
+    if from_client:
+        raise GuardError(
+            "GROK_BIN_CLIENT_FORBIDDEN",
+            "grok_bin is not accepted from client arguments; set GROK_DELEGATE_BIN",
+        )
+    raw = (value or DEFAULT_GROK_BIN).strip()
+    if not raw:
+        raise GuardError("GROK_BIN_INVALID", "grok binary is empty")
+
+    # Bare command name only.
+    base = raw.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if raw in {DEFAULT_GROK_BIN, "grok.exe"} or base in {"grok", "grok.exe"}:
+        if "/" not in raw.replace("\\", "/") and "\\" not in raw:
+            # bare name
+            if raw.lower() not in {"grok", "grok.exe"}:
+                raise GuardError(
+                    "GROK_BIN_INVALID",
+                    f"grok binary name must be grok or grok.exe, got {raw!r}",
+                )
+            return raw
+        # path form: basename must be grok/grok.exe; reject shells
+        if base not in {"grok", "grok.exe"}:
+            raise GuardError(
+                "GROK_BIN_INVALID",
+                f"grok binary path basename must be grok or grok.exe, got {base!r}",
+            )
+        # Reject obvious non-grok hijacks in path segments
+        lowered = raw.lower().replace("\\", "/")
+        for banned in ("cmd.exe", "powershell", "pwsh", "python", "bash", "sh.exe"):
+            if banned in lowered and base not in {"grok", "grok.exe"}:
+                raise GuardError("GROK_BIN_INVALID", "grok binary path looks unsafe")
+        return raw
+
+    raise GuardError(
+        "GROK_BIN_INVALID",
+        f"grok binary must be grok/grok.exe name or path, got {raw!r}",
+    )
