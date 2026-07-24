@@ -120,7 +120,7 @@ Captured under implementer scratch: `self-test-round4.log`, `smoke-delegate-roun
 
 | Gate | Result |
 |---|---|
-| `py -3 -m pytest tests -q` | **82 passed** (+ prior subtests) |
+| `py -3 -m pytest tests -q` | **85 passed** (+ prior subtests); includes lanes_parent status↔resolve env-pin regression and `resume=False` omit |
 | `py -3 -m py_compile` on package modules | **exit 0** |
 | B1–B9 / no always-approve / no bypass / no client grok_bin | **retained** in tests |
 
