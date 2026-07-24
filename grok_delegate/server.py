@@ -19,17 +19,27 @@ import traceback
 from pathlib import Path
 from typing import Any, Mapping, TextIO
 
-# Allow `python tools/grok-delegate/server.py` and package-relative imports.
+# Allow package and flat execution.
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_ROOT = _HERE.parent
+for _p in (str(_ROOT), str(_HERE)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-from audit import (  # noqa: E402
-    build_delegation_audit,
-    emit as audit_emit,
-)
-from guard import GuardError, structured_error  # noqa: E402
-from runner import delegate  # noqa: E402
+try:
+    from .audit import (  # type: ignore[no-redef]
+        build_delegation_audit,
+        emit as audit_emit,
+    )
+    from .guard import GuardError, structured_error, validate_grok_bin  # type: ignore[no-redef]
+    from .runner import delegate, is_path_inside  # type: ignore[no-redef]
+except ImportError:  # flat import when package dir is on sys.path
+    from audit import (  # noqa: E402
+        build_delegation_audit,
+        emit as audit_emit,
+    )
+    from guard import GuardError, structured_error, validate_grok_bin  # noqa: E402
+    from runner import delegate, is_path_inside  # noqa: E402
 
 SERVER_NAME = "grok-delegate"
 SERVER_VERSION = "0.1.0"
@@ -50,6 +60,7 @@ _TOOL_DESCRIPTIONS = {
     ),
 }
 
+# R5: grok_bin is intentionally absent from the client schema.
 _INPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -75,14 +86,21 @@ _INPUT_SCHEMA: dict[str, Any] = {
         },
         "repo_root": {
             "type": "string",
-            "description": "Optional absolute path to main repo root",
+            "description": (
+                "Optional absolute path to main repo root; must match server "
+                "configured GROK_DELEGATE_REPO_ROOT when that env is set"
+            ),
         },
         "lanes_parent": {
             "type": "string",
-            "description": "Optional parent dir for worktrees (default ../pcp-lanes)",
+            "description": (
+                "Optional parent dir for worktrees; rejected if inside repo_root "
+                "or outside GROK_DELEGATE_LANES_PARENT when that env is set"
+            ),
         },
     },
     "required": ["goal", "lane"],
+    "additionalProperties": False,
 }
 
 
@@ -90,8 +108,97 @@ def default_repo_root() -> Path:
     env = os.environ.get("GROK_DELEGATE_REPO_ROOT")
     if env:
         return Path(env).resolve()
-    # server.py lives at <repo>/tools/grok-delegate/server.py
-    return Path(__file__).resolve().parents[2]
+    # Package lives at <project>/grok_delegate/server.py
+    return Path(__file__).resolve().parents[1]
+
+
+def resolve_trusted_repo_root(
+    args: Mapping[str, Any],
+    *,
+    repo_root: Path | None = None,
+) -> Path:
+    """Resolve repo_root without blindly trusting the client (R5).
+
+    Server/env root is authoritative. Client ``repo_root`` is accepted only when
+    it resolves to the same path as the configured root.
+    """
+    configured = (repo_root or default_repo_root()).resolve()
+    client = args.get("repo_root")
+    if client is None or str(client).strip() == "":
+        return configured
+    try:
+        client_path = Path(str(client)).resolve()
+    except OSError as exc:
+        raise GuardError("REPO_ROOT_INVALID", f"invalid repo_root: {exc}") from exc
+    if client_path != configured:
+        # When env pin is set, never accept a different client root.
+        if os.environ.get("GROK_DELEGATE_REPO_ROOT"):
+            raise GuardError(
+                "REPO_ROOT_UNTRUSTED",
+                "client repo_root does not match GROK_DELEGATE_REPO_ROOT",
+            )
+        # Without env pin: still reject path that is not an absolute existing dir
+        # equal to the injected server repo_root (tests pass repo_root=...).
+        if repo_root is not None and client_path != Path(repo_root).resolve():
+            raise GuardError(
+                "REPO_ROOT_UNTRUSTED",
+                "client repo_root does not match server-configured repo_root",
+            )
+        if repo_root is None:
+            # No server pin and no env: refuse arbitrary client roots (fail closed).
+            raise GuardError(
+                "REPO_ROOT_UNTRUSTED",
+                "client repo_root requires GROK_DELEGATE_REPO_ROOT or server repo_root pin",
+            )
+    return configured
+
+
+def resolve_trusted_lanes_parent(
+    args: Mapping[str, Any],
+    *,
+    repo_root: Path,
+) -> Path | None:
+    """Resolve lanes_parent with confinement checks (R5).
+
+    - If GROK_DELEGATE_LANES_PARENT is set, client value must resolve inside it
+      (or equal it); if client omits lanes_parent, use the env path.
+    - Target parent must never resolve inside repo_root (enforced again in
+      prepare_worktree for the final worktree path).
+    """
+    env_parent = os.environ.get("GROK_DELEGATE_LANES_PARENT")
+    client = args.get("lanes_parent")
+
+    if env_parent:
+        pinned = Path(env_parent).resolve()
+        if client is None or str(client).strip() == "":
+            candidate = pinned
+        else:
+            candidate = Path(str(client)).resolve()
+            if candidate != pinned and not is_path_inside(candidate, pinned):
+                raise GuardError(
+                    "LANES_PARENT_UNTRUSTED",
+                    "client lanes_parent is outside GROK_DELEGATE_LANES_PARENT",
+                )
+    elif client is None or str(client).strip() == "":
+        return None
+    else:
+        candidate = Path(str(client)).resolve()
+
+    if is_path_inside(candidate, repo_root):
+        raise GuardError(
+            "LANES_PARENT_INSIDE_REPO",
+            "lanes_parent must not resolve inside the main repo working tree",
+        )
+    return candidate
+
+
+def resolve_server_grok_bin(args: Mapping[str, Any]) -> str:
+    """Grok binary from env/config only — never from undeclared client args (R5)."""
+    if "grok_bin" in args and args.get("grok_bin") is not None:
+        # Fail closed even if additionalProperties were bypassed.
+        validate_grok_bin(str(args.get("grok_bin")), from_client=True)
+    env_bin = os.environ.get("GROK_DELEGATE_BIN")
+    return validate_grok_bin(env_bin, from_client=False)
 
 
 def handle_tool_call(
@@ -143,14 +250,24 @@ def handle_tool_call(
         )
         return err
 
-    root = Path(args["repo_root"]).resolve() if args.get("repo_root") else (
-        repo_root or default_repo_root()
-    )
-    lanes_parent = args.get("lanes_parent")
+    try:
+        root = resolve_trusted_repo_root(args, repo_root=repo_root)
+        lanes_parent = resolve_trusted_lanes_parent(args, repo_root=root)
+        grok_bin = resolve_server_grok_bin(args)
+    except GuardError as exc:
+        err = structured_error(exc.code, exc.message)
+        _audit_failure(
+            principal=principal,
+            tool=name,
+            args=args,
+            result=err,
+            stream=audit_stream,
+        )
+        return err
+
     base_ref = str(args.get("base_ref") or "origin/dev")
     max_turns = args.get("max_turns")
     model = args.get("model")
-    grok_bin = args.get("grok_bin") or os.environ.get("GROK_DELEGATE_BIN") or "grok"
 
     try:
         result = delegate(
@@ -383,8 +500,8 @@ def main(argv: list[str] | None = None) -> int:
     if "--help" in args or "-h" in args:
         sys.stdout.write(
             "grok-delegate MCP (dev-only)\n"
-            "Usage: python tools/grok-delegate/server.py\n"
-            "Env: GROK_DELEGATE_REPO_ROOT, GROK_DELEGATE_BIN\n"
+            "Usage: python -m grok_delegate.server\n"
+            "Env: GROK_DELEGATE_REPO_ROOT, GROK_DELEGATE_BIN, GROK_DELEGATE_LANES_PARENT\n"
             "NOT the product admin-bridge (tools/mcp/).\n"
         )
         return 0

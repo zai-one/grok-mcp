@@ -25,8 +25,9 @@ try:
         enforce_bounds,
         normalize_lane,
         structured_error,
+        validate_grok_bin,
     )
-except ImportError:  # flat import when tools/grok-delegate is on sys.path
+except ImportError:  # flat import when package dir is on sys.path
     from guard import (  # type: ignore
         ALWAYS_APPROVE_FLAG,
         DEFAULT_GROK_BIN,
@@ -38,6 +39,7 @@ except ImportError:  # flat import when tools/grok-delegate is on sys.path
         enforce_bounds,
         normalize_lane,
         structured_error,
+        validate_grok_bin,
     )
 
 # Default wall-clock timeout for a single delegation (seconds).
@@ -508,6 +510,8 @@ def run_delegation(
     wt = str(Path(worktree_path).resolve())
 
     try:
+        # Validate bin even when caller passes through (R5 defense in depth).
+        grok_bin = validate_grok_bin(grok_bin, from_client=False)
         turns = enforce_bounds(max_turns, hard_cap=hard_cap)
         profile = build_permission_profile(plan_only=plan_only)
         argv = build_grok_argv(
