@@ -2,8 +2,8 @@
 
 Самодостаточная спека. Всё нужное — здесь; лезть в другие репозитории не требуется.
 
-**Рабочая директория:** `C:\Users\codex\Documents\Projects\MCP\Grok CLI` (этот проект).
-**Источник кода:** `C:\Users\codex\Documents\Projects\pcp-lanes\grokd-delegate-mcp\tools\grok-delegate\`
+**Рабочая директория:** `C:\Users\<USER>\Documents\Projects\MCP\Grok CLI` (этот проект).
+**Источник кода:** `C:\Users\<USER>\Documents\Projects\pcp-lanes\grokd-delegate-mcp\tools\grok-delegate\`
 (файлы: `guard.py`, `runner.py`, `audit.py`, `server.py`, `__init__.py`, `test_grok_delegate.py`, `README.md`).
 
 Что это: dev-only локальный MCP-сервер `grok_delegate` — принимает кодинг-цель и запускает локальный
