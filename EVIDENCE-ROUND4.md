@@ -1,6 +1,6 @@
 # grok_delegate — ROUND4 evidence
 
-Working directory: `C:\Users\codex\Documents\Projects\MCP\Grok CLI`  
+Working directory: `C:\Users\<USER>\Documents\Projects\MCP\Grok CLI`  
 Date: 2026-07-24  
 Builds on Round 3 (`EVIDENCE.md`, R1–R5).
 
